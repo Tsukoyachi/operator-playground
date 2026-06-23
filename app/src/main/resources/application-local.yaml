@@ -1,0 +1,3 @@
+app:
+  message-file: local/tmp.txt
+  secret-name: PATH
