@@ -1,0 +1,8 @@
+apiVersion: com.example.operator/v1
+kind: ApplicationResource
+metadata:
+  name: test-app
+  namespace: default
+spec:
+  applicationServerImage: ghcr.io/tsukoyachi/operator-playground-app
+  applicationServerVersion: "sha-84b2433"
