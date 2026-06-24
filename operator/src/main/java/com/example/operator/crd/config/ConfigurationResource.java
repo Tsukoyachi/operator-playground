@@ -1,7 +1,4 @@
-package com.example.operator.crd;
-
-import com.example.operator.crd.dto.ApplicationSpec;
-import com.example.operator.crd.dto.ApplicationStatus;
+package com.example.operator.crd.config;
 
 import io.fabric8.kubernetes.api.model.Namespaced;
 import io.fabric8.kubernetes.client.CustomResource;
@@ -10,5 +7,5 @@ import io.fabric8.kubernetes.model.annotation.Version;
 
 @Group("com.example.operator")
 @Version("v1")
-public class ApplicationResource extends CustomResource<ApplicationSpec, ApplicationStatus> implements Namespaced{
+public class ConfigurationResource extends CustomResource<ConfigurationSpec, ConfigurationStatus> implements Namespaced {
 }
