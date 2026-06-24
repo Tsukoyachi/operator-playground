@@ -1,0 +1,10 @@
+apiVersion: com.example.operator/v1
+kind: InfrastructureResource
+metadata:
+  name: demo-infra
+  namespace: reconciler-dev
+spec:
+  ingressHost: demo.local
+  replicas: 2
+  storageClassName: standard
+  secretName: demo-infra-secret

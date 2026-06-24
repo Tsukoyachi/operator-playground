@@ -2,6 +2,7 @@ package com.example.operator.reconciler;
 
 import com.example.operator.crd.app.ApplicationResource;
 import com.example.operator.crd.app.ApplicationSpec;
+import com.example.operator.crd.app.ApplicationStatus;
 import com.example.operator.crd.config.ConfigurationResource;
 import com.example.operator.crd.infra.InfrastructureResource;
 import io.fabric8.kubernetes.api.model.*;
@@ -35,31 +36,58 @@ public class ApplicationReconciler implements Reconciler<ApplicationResource> {
             Context<ApplicationResource> context) {
 
         var spec = app.getSpec();
+        var status = getOrCreate(app);
+
+        boolean ok = true;
+
+        var metadata = app.getMetadata();
+
+        if (metadata == null || metadata.getNamespace() == null || metadata.getNamespace().isBlank()) {
+            status.setState("ERROR");
+            status.setMessage("Missing metadata or namespace");
+            return UpdateControl.patchStatus(app);
+        }
+
+        String ns = metadata.getNamespace();
 
         // Load dependent CRs
-        ConfigurationResource config = loadConfig(spec.configurationRef());
-        InfrastructureResource infra = loadInfra(spec.infrastructureRef());
+        ConfigurationResource config = loadConfig(spec.configurationRef(), ns);
+        InfrastructureResource infra = loadInfra(spec.infrastructureRef(), ns);
 
         // Validate
         // todo: Add sub cr validation before going here
         if (config == null || infra == null) {
-            app.getStatus().setState("ERROR");
-            app.getStatus().setMessage("Missing config or infra");
+            status.setState("ERROR");
+            status.setMessage("Missing config or infra");
             return UpdateControl.patchStatus(app);
         }
 
         // Build desired state
         String image = buildImage(spec);
 
-        reconcileConfigMap(app, config);
-        reconcileSecret(app, infra);
-        reconcilePVC(app, infra);
-        reconcileDeployment(app, config, infra, image);
-        reconcileService(app);
-        reconcileIngress(app, infra);
+        ok &= reconcileConfigMap(app, config, status);
+        ok &= reconcileSecret(app, infra, status);
+        ok &= reconcilePVC(app, infra, status);
+        ok &= reconcileDeployment(app, config, infra, image, status);
+        ok &= reconcileService(app, status);
+        ok &= reconcileIngress(app, infra, status);
 
         // Status update
-        app.getStatus().setState("READY");
+        if (!ok) {
+            if (status.getState() == null || status.getState().equals("READY")) {
+                status.setState("DEGRADED");
+            }
+
+            if (status.getMessage() == null) {
+                status.setMessage("One or more resources failed to reconcile");
+            }
+
+            return UpdateControl.patchStatus(app);
+        }
+
+
+        status.setState("READY");
+        status.setMessage("Reconciled successfully");
 
         return UpdateControl.patchStatus(app);
     }
@@ -76,38 +104,48 @@ public class ApplicationReconciler implements Reconciler<ApplicationResource> {
         return "%s:%s".formatted(image, version);
     }
 
-    ConfigurationResource loadConfig(String name) {
+    ConfigurationResource loadConfig(String name, String namespace) {
         return client.resources(ConfigurationResource.class)
-                .inNamespace("default")
+                .inNamespace(Optional.ofNullable(namespace).orElse("default"))
                 .withName(name)
                 .get();
     }
 
-    InfrastructureResource loadInfra(String name) {
+    InfrastructureResource loadInfra(String name, String namespace) {
         return client.resources(InfrastructureResource.class)
-                .inNamespace("default")
+                .inNamespace(Optional.ofNullable(namespace).orElse("default"))
                 .withName(name)
                 .get();
     }
 
-    void reconcileConfigMap(ApplicationResource app, ConfigurationResource config) {
+    boolean reconcileConfigMap(ApplicationResource app, ConfigurationResource config, ApplicationStatus status) {
 
         var name = app.getMetadata().getName();
         var ns = app.getMetadata().getNamespace();
 
-        String yaml = buildApplicationYaml(app, config);
+        try {
+            String yaml = buildApplicationYaml(app, config);
 
-        var configMap = new io.fabric8.kubernetes.api.model.ConfigMapBuilder()
-                .withNewMetadata()
-                .withName(name + "-config")
-                .withNamespace(ns)
-                .endMetadata()
-                .addToData("application.yml", yaml)
-                .build();
+            var configMap = new ConfigMapBuilder()
+                    .withNewMetadata()
+                    .withName(name + "-config")
+                    .withNamespace(ns)
+                    .endMetadata()
+                    .addToData("application.yml", yaml)
+                    .build();
 
-        client.configMaps()
-                .inNamespace(ns)
-                .resource(configMap).serverSideApply();
+            client.configMaps()
+                    .inNamespace(ns)
+                    .resource(configMap)
+                    .serverSideApply();
+
+            return true;
+
+        } catch (Exception e) {
+            status.setState("ERROR");
+            status.setMessage("ConfigMap reconcile failed: " + e.getMessage());
+            return false;
+        }
     }
 
     String buildApplicationYaml(
@@ -137,15 +175,24 @@ public class ApplicationReconciler implements Reconciler<ApplicationResource> {
         );
     }
 
-    void reconcileSecret(ApplicationResource app, InfrastructureResource infra) {
+    boolean reconcileSecret(ApplicationResource app, InfrastructureResource infra, ApplicationStatus status) {
 
-        var ns = app.getMetadata().getNamespace();
+        try {
+            var ns = app.getMetadata().getNamespace();
+            var secret = buildSecret(app, infra);
 
-        var secret = buildSecret(app, infra);
+            client.secrets()
+                    .inNamespace(ns)
+                    .resource(secret)
+                    .serverSideApply();
 
-        client.secrets()
-                .inNamespace(ns)
-                .resource(secret).serverSideApply();
+            return true;
+
+        } catch (Exception e) {
+            status.setState("ERROR");
+            status.setMessage("Secret reconcile failed: " + e.getMessage());
+            return false;
+        }
     }
 
     Secret buildSecret(
@@ -172,23 +219,30 @@ public class ApplicationReconciler implements Reconciler<ApplicationResource> {
                 .build();
     }
 
-    void reconcilePVC(ApplicationResource app, InfrastructureResource infra) {
+    boolean reconcilePVC(ApplicationResource app, InfrastructureResource infra, ApplicationStatus status) {
 
-        var ns = app.getMetadata().getNamespace();
-        var name = app.getMetadata().getName();
+        try {
+            var ns = app.getMetadata().getNamespace();
+            var storageSize = infra.getSpec().storageSize();
 
-        var storageSize = infra.getSpec().storageSize();
-        if (storageSize == null || storageSize.isBlank()) {
-            storageSize = "100Mi";
+            if (storageSize == null || storageSize.isBlank()) {
+                storageSize = "100Mi";
+            }
+
+            var pvc = buildPVC(app, storageSize, infra.getSpec().storageClassName());
+
+            client.persistentVolumeClaims()
+                    .inNamespace(ns)
+                    .resource(pvc)
+                    .serverSideApply();
+
+            return true;
+
+        } catch (Exception e) {
+            status.setState("ERROR");
+            status.setMessage("PVC reconcile failed: " + e.getMessage());
+            return false;
         }
-
-        var storageClass = infra.getSpec().storageClassName();
-
-        var pvc = buildPVC(app, storageSize, storageClass);
-
-        client.persistentVolumeClaims()
-                .inNamespace(ns)
-                .resource(pvc).serverSideApply();
     }
 
     PersistentVolumeClaim buildPVC(
@@ -214,31 +268,36 @@ public class ApplicationReconciler implements Reconciler<ApplicationResource> {
                 .build();
     }
 
-    void reconcileDeployment(
+    boolean reconcileDeployment(
             ApplicationResource app,
             ConfigurationResource config,
             InfrastructureResource infra,
-            String image) {
+            String image,
+            ApplicationStatus status) {
 
-        var name = app.getMetadata().getName();
-        var ns = app.getMetadata().getNamespace();
+        try {
+            var name = app.getMetadata().getName();
+            var ns = app.getMetadata().getNamespace();
 
-        int replicas = infra.getSpec().replicas() != null
-                ? infra.getSpec().replicas()
-                : 1;
+            int replicas = infra.getSpec().replicas() != null
+                    ? infra.getSpec().replicas()
+                    : 1;
 
-        var deployment = buildDeployment(
-                name,
-                ns,
-                replicas,
-                image,
-                infra
-        );
+            var deployment = buildDeployment(name, ns, replicas, image, infra);
 
-        client.apps()
-                .deployments()
-                .inNamespace(ns)
-                .resource(deployment).serverSideApply();
+            client.apps()
+                    .deployments()
+                    .inNamespace(ns)
+                    .resource(deployment)
+                    .serverSideApply();
+
+            return true;
+
+        } catch (Exception e) {
+            status.setState("ERROR");
+            status.setMessage("Deployment reconcile failed: " + e.getMessage());
+            return false;
+        }
     }
 
     Deployment buildDeployment(
@@ -353,16 +412,26 @@ public class ApplicationReconciler implements Reconciler<ApplicationResource> {
                 .build();
     }
 
-    void reconcileService(ApplicationResource app) {
+    boolean reconcileService(ApplicationResource app, ApplicationStatus status) {
 
-        var name = app.getMetadata().getName();
-        var ns = app.getMetadata().getNamespace();
+        try {
+            var name = app.getMetadata().getName();
+            var ns = app.getMetadata().getNamespace();
 
-        var service = buildService(name, ns);
+            var service = buildService(name, ns);
 
-        client.services()
-                .inNamespace(ns)
-                .resource(service).serverSideApply();
+            client.services()
+                    .inNamespace(ns)
+                    .resource(service)
+                    .serverSideApply();
+
+            return true;
+
+        } catch (Exception e) {
+            status.setState("ERROR");
+            status.setMessage("Service reconcile failed: " + e.getMessage());
+            return false;
+        }
     }
 
     Service buildService(String name, String namespace) {
@@ -387,7 +456,7 @@ public class ApplicationReconciler implements Reconciler<ApplicationResource> {
                 .build();
     }
 
-    void reconcileIngress(ApplicationResource app, InfrastructureResource infra) {
+    boolean reconcileIngress(ApplicationResource app, InfrastructureResource infra, ApplicationStatus status) {
 
         var name = app.getMetadata().getName();
         var ns = app.getMetadata().getNamespace();
@@ -395,9 +464,9 @@ public class ApplicationReconciler implements Reconciler<ApplicationResource> {
         var host = infra.getSpec().ingressHost();
 
         if (host == null || host.isBlank()) {
-            app.getStatus().setState("DEGRADED");
-            app.getStatus().setMessage("Missing ingressHost in infra spec");
-            return;
+            status.setState("DEGRADED");
+            status.setMessage("Missing ingressHost in infra spec");
+            return false;
         }
 
         var ingress = buildIngress(name, ns, host);
@@ -407,6 +476,8 @@ public class ApplicationReconciler implements Reconciler<ApplicationResource> {
                 .ingresses()
                 .inNamespace(ns)
                 .resource(ingress).serverSideApply();
+
+        return true;
     }
 
     Ingress buildIngress(
@@ -443,5 +514,14 @@ public class ApplicationReconciler implements Reconciler<ApplicationResource> {
 
     String safe(String value) {
         return Optional.ofNullable(value).orElse("");
+    }
+
+    public static ApplicationStatus getOrCreate(ApplicationResource app) {
+        ApplicationStatus status = app.getStatus();
+        if (status == null) {
+            status = new ApplicationStatus();
+            app.setStatus(status);
+        }
+        return status;
     }
 }

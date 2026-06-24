@@ -1,0 +1,8 @@
+apiVersion: com.example.operator/v1
+kind: ConfigurationResource
+metadata:
+  name: demo-config
+  namespace: reconciler-dev
+spec:
+  messageFile: /config/message.txt
+  secretName: demo-config-secret

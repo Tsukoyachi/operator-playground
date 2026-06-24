@@ -1,0 +1,8 @@
+apiVersion: com.example.operator/v1
+kind: ApplicationResource
+metadata:
+  name: demo-app
+  namespace: reconciler-dev
+spec:
+  configurationRef: demo-config
+  infrastructureRef: demo-infra
